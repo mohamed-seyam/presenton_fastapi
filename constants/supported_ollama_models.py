@@ -116,6 +116,41 @@ SUPPORTED_DEEPSEEK_MODELS = {
 }
 
 SUPPORTED_QWEN_MODELS = {
+    "qwen2.5:0.5b": OllamaModelMetadata(
+        label="Qwen 2.5:0.5b",
+        value="qwen2.5:0.5b",
+        size="397MB",
+    ),
+    "qwen2.5:1.5b": OllamaModelMetadata(
+        label="Qwen 2.5:1.5b",
+        value="qwen2.5:1.5b",
+        size="987MB",
+    ),
+    "qwen2.5:3b": OllamaModelMetadata(
+        label="Qwen 2.5:3b",
+        value="qwen2.5:3b",
+        size="2.0GB",
+    ),
+    "qwen2.5:7b": OllamaModelMetadata(
+        label="Qwen 2.5:7b",
+        value="qwen2.5:7b",
+        size="4.7GB",
+    ),
+    "qwen2.5:14b": OllamaModelMetadata(
+        label="Qwen 2.5:14b",
+        value="qwen2.5:14b",
+        size="9.0GB",
+    ),
+    "qwen2.5:32b": OllamaModelMetadata(
+        label="Qwen 2.5:32b",
+        value="qwen2.5:32b",
+        size="20GB",
+    ),
+    "qwen2.5:72b": OllamaModelMetadata(
+        label="Qwen 2.5:72b",
+        value="qwen2.5:72b",
+        size="43GB",
+    ),
     "qwen3:0.6b": OllamaModelMetadata(
         label="Qwen 3:0.6b",
         value="qwen3:0.6b",
