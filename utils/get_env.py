@@ -84,6 +84,11 @@ def get_image_provider_env():
 def get_pixabay_api_key_env():
     return os.getenv("PIXABAY_API_KEY")
 
+def get_flux_api_key_env():
+    return os.getenv("FLUX_API_KEY")
+
+def get_flux_url_env():
+    return os.getenv("FLUX_URL")
 
 def get_tool_calls_env():
     return os.getenv("TOOL_CALLS")

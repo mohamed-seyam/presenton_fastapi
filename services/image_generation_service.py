@@ -9,12 +9,15 @@ from models.sql.image_asset import ImageAsset
 from utils.download_helpers import download_file
 from utils.get_env import get_pexels_api_key_env
 from utils.get_env import get_pixabay_api_key_env
+from utils.get_env import get_flux_api_key_env
+from utils.get_env import get_flux_url_env
 from utils.image_provider import (
     is_image_generation_disabled,
     is_pixels_selected,
     is_pixabay_selected,
     is_gemini_flash_selected,
     is_dalle3_selected,
+    is_flux_selected
 )
 import uuid
 
@@ -37,6 +40,8 @@ class ImageGenerationService:
             return self.generate_image_google
         elif is_dalle3_selected():
             return self.generate_image_openai
+        elif is_flux_selected():
+            return self.generate_image_flux
         return None
 
     def is_stock_provider_selected(self):
@@ -100,6 +105,77 @@ class ImageGenerationService:
         image_url = result.data[0].url
         return await download_file(image_url, output_directory)
 
+    async def generate_image_flux(self, prompt: str, output_directory: str) -> str:
+        flux_url = get_flux_url_env()
+        flux_api_key = get_flux_api_key_env()
+
+        if not flux_url or not flux_api_key:
+            raise Exception("FLUX_URL and FLUX_API_KEY must be set in environment or user config")
+
+        payload = {
+            "prompt": prompt,
+            "width": 512,
+            "height": 512,
+            "guidance_scale": 3.5,
+            "output_type": "pil",
+            "num_inference_steps": 5,
+            "max_sequence_length": 512
+        }
+
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': flux_api_key
+        }
+
+        # Set a 60 second timeout for Flux API
+        timeout = aiohttp.ClientTimeout(total=60)
+
+        async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as session:
+            async with session.post(
+                flux_url,
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"Flux API error: {response.status} - {error_text}")
+
+                # Check content type to determine response format
+                content_type = response.headers.get('Content-Type', '')
+
+                # If response is an image (JPEG, PNG, etc.)
+                if 'image/' in content_type:
+                    image_data = await response.read()
+                    # Determine file extension from content type
+                    ext = 'jpg' if 'jpeg' in content_type else 'png'
+                    image_path = os.path.join(output_directory, f"{uuid.uuid4()}.{ext}")
+                    with open(image_path, "wb") as f:
+                        f.write(image_data)
+                    return image_path
+
+                # If response is JSON
+                elif 'application/json' in content_type:
+                    result = await response.json()
+
+                    # If the API returns a URL
+                    if "url" in result:
+                        image_url = result["url"]
+                        return await download_file(image_url, output_directory)
+
+                    # If the API returns base64 image data
+                    elif "image" in result:
+                        import base64
+                        image_data = base64.b64decode(result["image"])
+                        image_path = os.path.join(output_directory, f"{uuid.uuid4()}.png")
+                        with open(image_path, "wb") as f:
+                            f.write(image_data)
+                        return image_path
+                    else:
+                        raise Exception(f"Unexpected Flux API response format: {result}")
+
+                else:
+                    raise Exception(f"Unexpected content type from Flux API: {content_type}") 
+    
     async def generate_image_google(self, prompt: str, output_directory: str) -> str:
         client = genai.Client()
         response = await asyncio.to_thread(

@@ -69,6 +69,14 @@ def set_pixabay_api_key_env(value):
     os.environ["PIXABAY_API_KEY"] = value
 
 
+def set_flux_api_key_env(value):
+    os.environ["FLUX_API_KEY"] = value
+
+
+def set_flux_url_env(value):
+    os.environ["FLUX_URL"] = value
+
+
 def set_disable_image_generation_env(value):
     os.environ["DISABLE_IMAGE_GENERATION"] = value
 

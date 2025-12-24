@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from api.lifespan import app_lifespan
 from api.middlewares import UserConfigEnvUpdateMiddleware
 from api.v1.ppt.router import API_V1_PPT_ROUTER
@@ -8,6 +9,10 @@ from api.v1.mock.router import API_V1_MOCK_ROUTER
 
 
 app = FastAPI(lifespan=app_lifespan)
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/app_data", StaticFiles(directory="app_data"), name="app_data")
 
 
 # Routers
