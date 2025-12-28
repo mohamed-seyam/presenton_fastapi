@@ -393,6 +393,7 @@ class LLMClient:
         depth: int = 0,
     ):
         extra_body = {"enable_thinking": False} if self.disable_thinking() else None
+        
         return await self._generate_openai(
             model=model,
             messages=messages,
@@ -753,6 +754,176 @@ class LLMClient:
             depth=depth,
         )
 
+    async def _generate_qwen_structured(
+        self,
+        model: str,
+        messages: List[LLMMessage],
+        response_format: dict,
+        strict: bool = False,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[dict]] = None,
+        extra_body: Optional[dict] = None,
+        depth: int = 0,
+    ) -> dict | None:
+        
+        client: AsyncOpenAI = self._client
+        response_schema = response_format
+        all_tools = [*tools] if tools else None
+
+        use_tool_calls_for_structured_output = (
+            self.use_tool_calls_for_structured_output()
+        )
+        if strict and depth == 0:
+            response_schema = ensure_strict_json_schema(
+                response_schema,
+                path=(),
+                root=response_schema,
+            )
+        if use_tool_calls_for_structured_output and depth == 0:
+            if all_tools is None:
+                all_tools = []
+            all_tools.append(
+                self.tool_calls_handler.parse_tool(
+                    LLMDynamicTool(
+                        name="ResponseSchema",
+                        description="Provide response to the user",
+                        parameters=response_schema,
+                        handler=do_nothing_async,
+                    ),
+                    strict=strict,
+                )
+            )
+        
+        # Accumulate the full response 
+        full_content = ""
+        in_tool_call = False
+        tool_call_buffer = ""
+
+        async for event in await self._client.chat.completions.create(
+            model=model, 
+            messages = [msg.model_dump() for msg in messages],
+            tools = all_tools,
+            stream = True,
+            response_format=(
+                    {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "ResponseSchema",
+                            "strict": strict,
+                            "schema": response_schema,
+                        }
+                    }
+                    if not use_tool_calls_for_structured_output
+                    else None
+                ),
+        ):
+
+            if not event.choices:
+                continue
+
+            delta = event.choices[0].delta
+
+
+            # Qwen returns tool calls as text content wrapped in <tool_call> tags
+            if delta.content:
+                chunk = delta.content
+                full_content += chunk
+                
+                # Detect tool call start
+                if '<tool_call>' in chunk:
+                    in_tool_call = True
+                    tool_call_buffer = chunk
+                    continue
+                
+                # Accumulate tool call content
+                if in_tool_call:
+                    tool_call_buffer += chunk
+                    
+                    # Detect tool call end
+                    if '</tool_call>' in chunk:
+                        in_tool_call = False
+                        # Don't print the tool call wrapper
+                        continue
+
+
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[message.model_dump() for message in messages],
+            response_format=(
+                {
+                    "type": "json_schema",
+                    "json_schema": (
+                        {
+                            "name": "ResponseSchema",
+                            "strict": strict,
+                            "schema": response_schema,
+                        }
+                    ),
+                }
+                if not use_tool_calls_for_structured_output
+                else None
+            ),
+            max_completion_tokens=max_tokens,
+            tools=all_tools,
+            extra_body=extra_body,
+        )
+
+        if len(response.choices) == 0:
+            return None
+
+        content = response.choices[0].message.content
+
+        tool_calls = response.choices[0].message.tool_calls
+        has_response_schema = False
+
+        if tool_calls:
+            for tool_call in tool_calls:
+                if tool_call.function.name == "ResponseSchema":
+                    content = tool_call.function.arguments
+                    has_response_schema = True
+
+            if not has_response_schema:
+                parsed_tool_calls = [
+                    OpenAIToolCall(
+                        id=tool_call.id,
+                        type=tool_call.type,
+                        function=OpenAIToolCallFunction(
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                        ),
+                    )
+                    for tool_call in tool_calls
+                ]
+                tool_call_messages = (
+                    await self.tool_calls_handler.handle_tool_calls_openai(
+                        parsed_tool_calls
+                    )
+                )
+                new_messages = [
+                    *messages,
+                    OpenAIAssistantMessage(
+                        role="assistant",
+                        content=response.choices[0].message.content,
+                        tool_calls=[each.model_dump() for each in parsed_tool_calls],
+                    ),
+                    *tool_call_messages,
+                ]
+                content = await self._generate_openai_structured(
+                    model=model,
+                    messages=new_messages,
+                    response_format=response_schema,
+                    strict=strict,
+                    max_tokens=max_tokens,
+                    tools=all_tools,
+                    extra_body=extra_body,
+                    depth=depth + 1,
+                )
+        if content:
+            if depth == 0:
+                return dict(dirtyjson.loads(content))
+            return content
+        return None
+    
     async def _generate_custom_structured(
         self,
         model: str,
@@ -763,6 +934,17 @@ class LLMClient:
         depth: int = 0,
     ):
         extra_body = {"enable_thinking": False} if self.disable_thinking() else None
+        if model.startswith("Qwen"):
+            return await self._generate_qwen_structured(
+                model=model,
+                messages=messages,
+                response_format=response_format,
+                strict=strict,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
+                depth=depth,
+            )
+
         return await self._generate_openai_structured(
             model=model,
             messages=messages,
@@ -1497,6 +1679,337 @@ class LLMClient:
             depth=depth,
         )
 
+    async def _stream_qwen_structured(
+        self,
+        model: str,
+        messages: List[LLMMessage],
+        response_format: dict,
+        strict: bool = False,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[dict]] = None,
+        depth: int = 0,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Stream structured output from Qwen with tool call support.
+        
+        This method handles Qwen's unique behavior where tool calls can be returned in two formats:
+        1. Standard OpenAI-style tool_calls in the delta (newer Qwen models)
+        2. Text-based tool calls wrapped in <tool_call>...</tool_call> tags (fallback)
+        
+        The function:
+        - Streams response content in real-time
+        - Detects and handles tool calls (both formats)
+        - Executes non-ResponseSchema tools and makes recursive calls with results
+        - Yields ResponseSchema tool arguments as streaming JSON
+        
+        Args:
+            model: Qwen model name
+            messages: Conversation history
+            response_format: JSON schema for structured output
+            strict: Enable strict JSON schema validation
+            max_tokens: Maximum tokens to generate
+            tools: List of parsed tool definitions
+            depth: Recursion depth (incremented on tool call recursion)
+        
+        Yields:
+            str: Response content chunks (streaming)
+        """
+        import re
+        import json
+        from models.llm_message import OpenAIAssistantMessage
+
+        client: AsyncOpenAI = self._client
+        
+        extra_body = {"enable_thinking": False} if self.disable_thinking() else None
+        
+
+        response_schema = response_format
+        all_tools = [*tools] if tools is not None else []
+
+        # Determine if we should use tool calls for structured output
+        use_tool_calls_for_structured_output = self.use_tool_calls_for_structured_output()
+
+        # Apply strict JSON schema validation
+        if strict:
+            response_schema = ensure_strict_json_schema(
+                response_schema,
+                path=(),
+                root=response_schema,
+            )
+
+        # Add ResponseSchema tool to capture structured output via tool calls
+        if use_tool_calls_for_structured_output and depth == 0:
+            if all_tools is None:
+                all_tools = []
+            all_tools.append(
+                self.tool_calls_handler.parse_tool(
+                    LLMDynamicTool(
+                        name="ResponseSchema",
+                        description="Provide response to the user",
+                        parameters=response_schema,
+                        handler=do_nothing_async,
+                    ),
+                    strict=strict,
+                )
+            )
+
+        # ===== Tool call tracking variables =====
+
+        # Standard OpenAI-style tool calls (accumulate chunks into complete calls)
+        tool_calls: List[OpenAIToolCall] = []
+        current_index = 0
+        current_id = None
+        current_name = None
+        current_arguments = None
+
+        # Text-based tool call tracking (Qwen XML format fallback)
+        has_tool_calls = False  # True if any tool calls detected (either format)
+        in_tool_call_text = False  # True while inside <tool_call> tags
+        tool_call_text_buffer = ""  # Accumulates complete <tool_call>...</tool_call> block
+
+        # ResponseSchema tracking
+        has_response_schema_tool_call = False  # True if ResponseSchema tool was called
+
+        # ===== PHASE 1: Stream the initial LLM response =====
+
+        event_count = 0
+        yielded_count = 0
+
+        async for event in await client.chat.completions.create(
+            model=model,
+            messages=[message.model_dump() for message in messages],
+            max_completion_tokens=max_tokens,
+            tools=all_tools,
+            response_format=(
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ResponseSchema",
+                        "strict": strict,
+                        "schema": response_schema,
+                    }
+                }
+                if not use_tool_calls_for_structured_output
+                else None
+            ),
+            extra_body=extra_body,
+            stream=True,
+        ):
+            event: OpenAIChatCompletionChunk = event
+            event_count += 1
+
+            if not event.choices:
+                if event_count <= 3:
+                    continue
+
+            content_chunk = event.choices[0].delta.content
+            tool_call_chunk = event.choices[0].delta.tool_calls
+
+
+            # ===== Handle standard OpenAI-style tool calls =====
+            if tool_call_chunk:
+                has_tool_calls = True
+                tool_index = tool_call_chunk[0].index
+                tool_id = tool_call_chunk[0].id
+                tool_name = tool_call_chunk[0].function.name
+                tool_arguments = tool_call_chunk[0].function.arguments
+
+
+                # Check if this is a new tool call (index changed)
+                if current_index != tool_index:
+                    # Save the previous tool call if exists
+                    if current_id is not None:
+                        tool_calls.append(
+                            OpenAIToolCall(
+                                id=current_id,
+                                type="function",
+                                function=OpenAIToolCallFunction(
+                                    name=current_name,
+                                    arguments=current_arguments,
+                                ),
+                            )
+                        )
+                    # Start tracking the new tool call
+                    current_index = tool_index
+                    current_id = tool_id
+                    current_name = tool_name
+                    current_arguments = tool_arguments
+                else:
+                    # Accumulate chunks for the current tool call
+                    current_name = tool_name or current_name
+                    current_id = tool_id or current_id
+                    if current_arguments is None:
+                        current_arguments = tool_arguments
+                    elif tool_arguments:
+                        current_arguments += tool_arguments
+
+                # Special handling: Stream ResponseSchema arguments directly
+                if current_name == "ResponseSchema":
+                    if tool_arguments:
+                        yielded_count += 1
+                        yield tool_arguments
+                    has_response_schema_tool_call = True
+
+            # ===== Handle content chunks =====
+            if content_chunk:
+                # If no standard tool calls detected yet, check for text-based tool calls
+                if not has_tool_calls:
+                    # Detect start of text-based tool call
+                    if '<tool_call>' in content_chunk:
+                        in_tool_call_text = True
+                        tool_call_text_buffer = content_chunk
+                        # Don't yield the opening tag
+                        continue
+                    # Accumulate text while inside tool call block
+                    elif in_tool_call_text:
+                        tool_call_text_buffer += content_chunk
+
+                        # Check if we've reached the end of the tool call block
+                        if '</tool_call>' in content_chunk:
+                            in_tool_call_text = False
+                            has_tool_calls = True
+                            # Extract and parse the tool call immediately
+                            match = re.search(
+                                r'<tool_call>\s*(\{.*?\})\s*</tool_call>',
+                                tool_call_text_buffer,
+                                re.DOTALL
+                            )
+                            if match:
+                                try:
+                                    tool_data = json.loads(match.group(1))
+                                    tool_name = tool_data.get("name")
+                                    tool_args = tool_data.get("arguments", {})
+
+                                    if tool_name == "ResponseSchema":
+                                        # Yield the structured response as JSON
+                                        yielded_count += 1
+                                        yield json.dumps(tool_args)
+                                        has_response_schema_tool_call = True
+                                    else:
+                                        # Regular tool - add to tool_calls list for execution
+                                        tool_calls.append(
+                                            OpenAIToolCall(
+                                                id=f"text_tool_call_{len(tool_calls)}",
+                                                type="function",
+                                                function=OpenAIToolCallFunction(
+                                                    name=tool_name,
+                                                    arguments=json.dumps(tool_args)
+                                                )
+                                            )
+                                        )
+                                except json.JSONDecodeError as e:
+                                    print(f"⚠ Failed to parse text-based tool call: {e}")
+                            # Clear the buffer and continue
+                            tool_call_text_buffer = ""
+                            continue
+                        # Still inside the tool call, don't yield yet
+                        continue
+
+                    # Yield regular content (not inside tool call tags)
+                    if not in_tool_call_text:
+                        yielded_count += 1
+                        yield content_chunk
+                else:
+                    # We have tool calls detected - still yield content that's not tool-related
+                    # This handles cases where model returns mixed content
+                    yielded_count += 1
+                    yield content_chunk
+
+        # ===== PHASE 2: Finalize tool call collection =====
+        
+        # Save the last accumulated tool call if any
+        if current_id is not None:
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=current_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(
+                        name=current_name,
+                        arguments=current_arguments,
+                    ),
+                )
+            )
+
+        # ===== PHASE 3: Parse text-based tool call (Qwen XML format fallback) =====
+        
+        if tool_call_text_buffer:
+            # Extract JSON from <tool_call>...</tool_call> tags
+            match = re.search(
+                r'<tool_call>\s*(\{.*?\})\s*</tool_call>', 
+                tool_call_text_buffer, 
+                re.DOTALL
+            )
+            if match:
+                try:
+                    tool_data = json.loads(match.group(1))
+                    tool_name = tool_data.get("name")
+                    tool_args = tool_data.get("arguments", {})
+
+                    # Special case: ResponseSchema tool
+                    if tool_name == "ResponseSchema":
+                        # Yield the structured response as JSON
+                        yield json.dumps(tool_args)
+                        has_response_schema_tool_call = True
+                    else:
+                        # Regular tool - add to tool_calls list for execution
+                        tool_calls.append(
+                            OpenAIToolCall(
+                                id=f"text_tool_call_{len(tool_calls)}",
+                                type="function",
+                                function=OpenAIToolCallFunction(
+                                    name=tool_name,
+                                    arguments=json.dumps(tool_args)
+                                )
+                            )
+                        )
+                except json.JSONDecodeError as e:
+                    # Log parsing error but continue execution
+                    print(f"⚠ Failed to parse text-based tool call: {e}")
+
+        # ===== PHASE 4: Execute non-ResponseSchema tools recursively =====
+        
+        # If we have tool calls that aren't ResponseSchema, execute them
+        if tool_calls and not has_response_schema_tool_call:
+            # Execute all tools and get results
+            tool_call_messages = await self.tool_calls_handler.handle_tool_calls_openai(
+                tool_calls
+            )
+            
+            # Build new conversation with tool results
+            new_messages = [
+                *messages,
+                OpenAIAssistantMessage(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[each.model_dump() for each in tool_calls],
+                ),
+                *tool_call_messages,
+            ]
+            
+            # Recursively call with tool results to get final structured response
+            # For recursive calls, only pass the ResponseSchema tool (not the original tools)
+
+            # Create a tools list with ONLY the ResponseSchema tool
+            response_schema_tool = self.tool_calls_handler.parse_tool(
+                LLMDynamicTool(
+                    name="ResponseSchema",
+                    description="Provide the final response to the user in the required format",
+                    parameters=response_schema,
+                    handler=do_nothing_async,
+                ),
+                strict=strict,
+            )
+
+            async for chunk in self._stream_qwen_structured(
+                model=model,
+                messages=new_messages,
+                max_tokens=max_tokens,
+                response_format=response_schema,
+                strict=strict,
+                tools=[response_schema_tool],  # Only ResponseSchema tool, not the original tools
+                depth=depth + 1,
+            ):
+                yield chunk
     def _stream_custom_structured(
         self,
         model: str,
@@ -1506,7 +2019,17 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         depth: int = 0,
     ):
-        extra_body = {"enable_thinking": False} if self.disable_thinking() else None
+        if model.startswith("Qwen"):
+            return self._stream_qwen_structured(
+                model=model,
+                messages=messages,
+                response_format=response_format,
+                strict=strict,
+                max_tokens=max_tokens,
+                depth=depth,
+                )
+        
+        extra_body = {"enable_thinking": False} if self.disable_thinking() else None 
         return self._stream_openai_structured(
             model=model,
             messages=messages,
