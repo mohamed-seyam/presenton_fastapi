@@ -8,40 +8,38 @@ from services.image_generation_service import ImageGenerationService
 from utils.asset_directory_utils import get_images_directory
 from utils.dict_utils import get_dict_at_path, get_dict_paths_with_key, set_dict_at_path
 
+# Global semaphore to limit concurrent slide processing
+# This makes debugging easier and prevents resource exhaustion
+SLIDE_PROCESSING_SEMAPHORE = asyncio.Semaphore(2)  # Process max 2 slides at once
+
 
 async def process_slide_and_fetch_assets(
     image_generation_service: ImageGenerationService,
     slide: SlideModel,
 ) -> List[ImageAsset]:
-
-    async_tasks = []
+    # Process assets SEQUENTIALLY to avoid nested semaphore deadlock
+    # No semaphore needed here since Flux API already has its own semaphore
+    print(f"[ASSET-FETCH] Slide {slide.id}: Starting asset fetch")
 
     image_paths = get_dict_paths_with_key(slide.content, "__image_prompt__")
     icon_paths = get_dict_paths_with_key(slide.content, "__icon_query__")
 
-    for image_path in image_paths:
-        __image_prompt__parent = get_dict_at_path(slide.content, image_path)
-        async_tasks.append(
-            image_generation_service.generate_image(
-                ImagePrompt(
-                    prompt=__image_prompt__parent["__image_prompt__"],
-                )
-            )
-        )
-
-    for icon_path in icon_paths:
-        __icon_query__parent = get_dict_at_path(slide.content, icon_path)
-        async_tasks.append(
-            ICON_FINDER_SERVICE.search_icons(__icon_query__parent["__icon_query__"])
-        )
-
-    results = await asyncio.gather(*async_tasks)
-    results.reverse()
+    print(f"[ASSET-FETCH] Slide {slide.id}: Found {len(image_paths)} image(s) and {len(icon_paths)} icon(s)")
 
     return_assets = []
-    for image_path in image_paths:
+
+    # Process images SEQUENTIALLY (one at a time)
+    for i, image_path in enumerate(image_paths, 1):
+        __image_prompt__parent = get_dict_at_path(slide.content, image_path)
+        prompt = __image_prompt__parent["__image_prompt__"]
+
+        print(f"[ASSET-FETCH] Slide {slide.id}: Generating image {i}/{len(image_paths)}")
+
+        result = await image_generation_service.generate_image(
+            ImagePrompt(prompt=prompt)
+        )
+
         image_dict = get_dict_at_path(slide.content, image_path)
-        result = results.pop()
         if isinstance(result, ImageAsset):
             return_assets.append(result)
             image_dict["__image_url__"] = result.path
@@ -49,11 +47,24 @@ async def process_slide_and_fetch_assets(
             image_dict["__image_url__"] = result
         set_dict_at_path(slide.content, image_path, image_dict)
 
-    for icon_path in icon_paths:
+        print(f"[ASSET-FETCH] Slide {slide.id}: Image {i}/{len(image_paths)} complete")
+
+    # Process icons SEQUENTIALLY (one at a time)
+    for i, icon_path in enumerate(icon_paths, 1):
+        __icon_query__parent = get_dict_at_path(slide.content, icon_path)
+        query = __icon_query__parent["__icon_query__"]
+
+        print(f"[ASSET-FETCH] Slide {slide.id}: Fetching icon {i}/{len(icon_paths)}")
+
+        icon_result = await ICON_FINDER_SERVICE.search_icons(query)
+
         icon_dict = get_dict_at_path(slide.content, icon_path)
-        icon_dict["__icon_url__"] = results.pop()[0]
+        icon_dict["__icon_url__"] = icon_result[0]
         set_dict_at_path(slide.content, icon_path, icon_dict)
 
+        print(f"[ASSET-FETCH] Slide {slide.id}: Icon {i}/{len(icon_paths)} complete")
+
+    print(f"[ASSET-FETCH] Slide {slide.id}: Completed - {len(return_assets)} new assets")
     return return_assets
 
 

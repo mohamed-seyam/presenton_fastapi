@@ -280,14 +280,15 @@ async def stream_presentation(
         layout = presentation.get_layout()
         outline = presentation.get_presentation_outline()
 
-        # These tasks will be gathered and awaited after all slides are generated
-        async_assets_generation_tasks = []
-
+        # Process slides and fetch assets SEQUENTIALLY to avoid deadlock
         slides: List[SlideModel] = []
+        generated_assets = []
+
         yield SSEResponse(
             event="response",
             data=json.dumps({"type": "chunk", "chunk": '{ "slides": [ '}),
         ).to_string()
+
         for i, slide_layout_index in enumerate(structure.slides):
             slide_layout = layout.slides[slide_layout_index]
 
@@ -317,25 +318,23 @@ async def stream_presentation(
             # This will mutate slide and add placeholder assets
             process_slide_add_placeholder_assets(slide)
 
-            # This will mutate slide
-            async_assets_generation_tasks.append(
-                process_slide_and_fetch_assets(image_generation_service, slide)
-            )
-
             yield SSEResponse(
                 event="response",
                 data=json.dumps({"type": "chunk", "chunk": slide.model_dump_json()}),
             ).to_string()
 
+            # Fetch assets for this slide IMMEDIATELY (sequentially)
+            print(f"[STREAM] Processing assets for slide {i+1}/{len(structure.slides)}")
+            try:
+                assets_list = await process_slide_and_fetch_assets(image_generation_service, slide)
+                generated_assets.extend(assets_list)
+            except Exception as e:
+                print(f"[STREAM] Error fetching assets for slide {i+1}: {e}")
+
         yield SSEResponse(
             event="response",
             data=json.dumps({"type": "chunk", "chunk": " ] }"}),
         ).to_string()
-
-        generated_assets_lists = await asyncio.gather(*async_assets_generation_tasks)
-        generated_assets = []
-        for assets_list in generated_assets_lists:
-            generated_assets.extend(assets_list)
 
         # Moved this here to make sure new slides are generated before deleting the old ones
         await sql_session.execute(
@@ -716,12 +715,9 @@ async def generate_presentation_handler(
                 slides.append(slide)
                 batch_slides.append(slide)
 
-            # Start asset fetch tasks for just-generated slides so they run while next batch is processed
-            asset_tasks = [
-                process_slide_and_fetch_assets(image_generation_service, slide)
-                for slide in batch_slides
-            ]
-            async_assets_generation_tasks.extend(asset_tasks)
+            # DON'T create tasks - we'll process slides sequentially
+            # This avoids nested semaphore deadlock with Flux API
+            # async_assets_generation_tasks.extend(asset_tasks)  # REMOVED
 
         if async_status:
             async_status.message = "Fetching assets for slides"
@@ -729,11 +725,19 @@ async def generate_presentation_handler(
             sql_session.add(async_status)
             await sql_session.commit()
 
-        # Run all asset tasks concurrently while batches may still be generating content
-        generated_assets_list = await asyncio.gather(*async_assets_generation_tasks)
+        # Process slides SEQUENTIALLY to avoid nested semaphore deadlock
+        # Each slide's images are already processed sequentially in process_slide_and_fetch_assets
+        print(f"[PRESENTATION-GEN] Starting SEQUENTIAL asset fetch for {len(slides)} slides")
         generated_assets = []
-        for assets_list in generated_assets_list:
-            generated_assets.extend(assets_list)
+        for i, slide in enumerate(slides, 1):
+            print(f"[PRESENTATION-GEN] Processing slide {i}/{len(slides)}")
+            try:
+                assets_list = await process_slide_and_fetch_assets(image_generation_service, slide)
+                generated_assets.extend(assets_list)
+                print(f"[PRESENTATION-GEN] Slide {i}/{len(slides)} completed")
+            except Exception as e:
+                print(f"[PRESENTATION-GEN] Slide {i}/{len(slides)} failed: {e}")
+                # Continue with other slides even if one fails
 
         # 8. Save PresentationModel and Slides
         sql_session.add(presentation)

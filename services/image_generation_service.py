@@ -23,10 +23,25 @@ import uuid
 
 
 class ImageGenerationService:
+    # Class-level semaphore shared across all instances
+    # This ensures only 1 Flux request runs at a time globally
+    _flux_semaphore = None
+    _semaphore_lock = None
+
     def __init__(self, output_directory: str):
         self.output_directory = output_directory
         self.is_image_generation_disabled = is_image_generation_disabled()
         self.image_gen_func = self.get_image_gen_func()
+        # Initialize class-level semaphore on first instance creation
+        if ImageGenerationService._flux_semaphore is None:
+            ImageGenerationService._flux_semaphore = asyncio.Semaphore(1)
+
+    @property
+    def flux_semaphore(self):
+        """Access the shared class-level semaphore"""
+        if ImageGenerationService._flux_semaphore is None:
+            ImageGenerationService._flux_semaphore = asyncio.Semaphore(1)
+        return ImageGenerationService._flux_semaphore
 
     def get_image_gen_func(self):
         if self.is_image_generation_disabled:
@@ -106,75 +121,82 @@ class ImageGenerationService:
         return await download_file(image_url, output_directory)
 
     async def generate_image_flux(self, prompt: str, output_directory: str) -> str:
-        flux_url = get_flux_url_env()
-        flux_api_key = get_flux_api_key_env()
+        # Use semaphore to limit concurrent Flux API requests
+        print(f"[FLUX DEBUG] Waiting for semaphore... (prompt: {prompt[:50]}...)")
+        async with self.flux_semaphore:
+            print(f"[FLUX DEBUG] Semaphore acquired, starting Flux request")
+            flux_url = get_flux_url_env()
+            flux_api_key = get_flux_api_key_env()
 
-        if not flux_url or not flux_api_key:
-            raise Exception("FLUX_URL and FLUX_API_KEY must be set in environment or user config")
+            if not flux_url or not flux_api_key:
+                raise Exception("FLUX_URL and FLUX_API_KEY must be set in environment or user config")
 
-        payload = {
-            "prompt": prompt,
-            "width": 512,
-            "height": 512,
-            "guidance_scale": 3.5,
-            "output_type": "pil",
-            "num_inference_steps": 5,
-            "max_sequence_length": 512
-        }
+            payload = {
+                "prompt": prompt,
+                "width": 512,
+                "height": 512,
+                "guidance_scale": 3.5,
+                "output_type": "pil",
+                "num_inference_steps": 5,
+                "max_sequence_length": 512
+            }
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': flux_api_key
-        }
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': flux_api_key
+            }
 
-        # Set a 60 second timeout for Flux API
-        timeout = aiohttp.ClientTimeout(total=60)
+            # Set a 120 second timeout for Flux API (increased from 60)
+            timeout = aiohttp.ClientTimeout(total=120)
 
-        async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as session:
-            async with session.post(
-                flux_url,
-                headers=headers,
-                json=payload
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"Flux API error: {response.status} - {error_text}")
+            print(f"[FLUX DEBUG] Making HTTP POST to {flux_url}")
+            async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as session:
+                async with session.post(
+                    flux_url,
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    print(f"[FLUX DEBUG] Received response with status: {response.status}")
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"Flux API error: {response.status} - {error_text}")
 
-                # Check content type to determine response format
-                content_type = response.headers.get('Content-Type', '')
+                    # Check content type to determine response format
+                    content_type = response.headers.get('Content-Type', '')
+                    print(f"[FLUX DEBUG] Response content type: {content_type}")
 
-                # If response is an image (JPEG, PNG, etc.)
-                if 'image/' in content_type:
-                    image_data = await response.read()
-                    # Determine file extension from content type
-                    ext = 'jpg' if 'jpeg' in content_type else 'png'
-                    image_path = os.path.join(output_directory, f"{uuid.uuid4()}.{ext}")
-                    with open(image_path, "wb") as f:
-                        f.write(image_data)
-                    return image_path
-
-                # If response is JSON
-                elif 'application/json' in content_type:
-                    result = await response.json()
-
-                    # If the API returns a URL
-                    if "url" in result:
-                        image_url = result["url"]
-                        return await download_file(image_url, output_directory)
-
-                    # If the API returns base64 image data
-                    elif "image" in result:
-                        import base64
-                        image_data = base64.b64decode(result["image"])
-                        image_path = os.path.join(output_directory, f"{uuid.uuid4()}.png")
+                    # If response is an image (JPEG, PNG, etc.)
+                    if 'image/' in content_type:
+                        image_data = await response.read()
+                        # Determine file extension from content type
+                        ext = 'jpg' if 'jpeg' in content_type else 'png'
+                        image_path = os.path.join(output_directory, f"{uuid.uuid4()}.{ext}")
                         with open(image_path, "wb") as f:
                             f.write(image_data)
                         return image_path
-                    else:
-                        raise Exception(f"Unexpected Flux API response format: {result}")
 
-                else:
-                    raise Exception(f"Unexpected content type from Flux API: {content_type}") 
+                    # If response is JSON
+                    elif 'application/json' in content_type:
+                        result = await response.json()
+
+                        # If the API returns a URL
+                        if "url" in result:
+                            image_url = result["url"]
+                            return await download_file(image_url, output_directory)
+
+                        # If the API returns base64 image data
+                        elif "image" in result:
+                            import base64
+                            image_data = base64.b64decode(result["image"])
+                            image_path = os.path.join(output_directory, f"{uuid.uuid4()}.png")
+                            with open(image_path, "wb") as f:
+                                f.write(image_data)
+                            return image_path
+                        else:
+                            raise Exception(f"Unexpected Flux API response format: {result}")
+
+                    else:
+                        raise Exception(f"Unexpected content type from Flux API: {content_type}") 
     
     async def generate_image_google(self, prompt: str, output_directory: str) -> str:
         client = genai.Client()
