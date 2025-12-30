@@ -290,9 +290,18 @@ async def stream_presentation(
         ).to_string()
 
         for i, slide_layout_index in enumerate(structure.slides):
+            print(f"[STREAM] ===== Starting slide {i+1}/{len(structure.slides)} =====")
             slide_layout = layout.slides[slide_layout_index]
 
             try:
+                print(f"[STREAM] Slide {i+1}: Generating content...")
+
+                # Send a heartbeat before LLM call to keep connection alive
+                yield SSEResponse(
+                    event="heartbeat",
+                    data=json.dumps({"slide": i+1, "status": "generating_content"}),
+                ).to_string()
+
                 slide_content = await get_slide_content_from_type_and_outline(
                     slide_layout,
                     outline.slides[i],
@@ -301,8 +310,16 @@ async def stream_presentation(
                     presentation.verbosity,
                     presentation.instructions,
                 )
+                print(f"[STREAM] Slide {i+1}: Content generated successfully")
             except HTTPException as e:
+                print(f"[STREAM] Slide {i+1}: HTTPException during content generation: {e.detail}")
                 yield SSEErrorResponse(detail=e.detail).to_string()
+                return
+            except Exception as e:
+                print(f"[STREAM] Slide {i+1}: Unexpected error during content generation: {e}")
+                import traceback
+                traceback.print_exc()
+                yield SSEErrorResponse(detail=str(e)).to_string()
                 return
 
             slide = SlideModel(
@@ -318,18 +335,31 @@ async def stream_presentation(
             # This will mutate slide and add placeholder assets
             process_slide_add_placeholder_assets(slide)
 
+            print(f"[STREAM] Slide {i+1}: Sending slide data to client...")
             yield SSEResponse(
                 event="response",
                 data=json.dumps({"type": "chunk", "chunk": slide.model_dump_json()}),
             ).to_string()
 
             # Fetch assets for this slide IMMEDIATELY (sequentially)
-            print(f"[STREAM] Processing assets for slide {i+1}/{len(structure.slides)}")
+            print(f"[STREAM] Slide {i+1}: Starting asset fetch...")
+
+            # Send heartbeat before asset fetch to keep connection alive
+            yield SSEResponse(
+                event="heartbeat",
+                data=json.dumps({"slide": i+1, "status": "fetching_assets"}),
+            ).to_string()
+
             try:
                 assets_list = await process_slide_and_fetch_assets(image_generation_service, slide)
                 generated_assets.extend(assets_list)
+                print(f"[STREAM] Slide {i+1}: Asset fetch completed successfully")
             except Exception as e:
-                print(f"[STREAM] Error fetching assets for slide {i+1}: {e}")
+                print(f"[STREAM] Slide {i+1}: Error fetching assets: {e}")
+                import traceback
+                traceback.print_exc()
+
+            print(f"[STREAM] ===== Slide {i+1}/{len(structure.slides)} COMPLETE =====\n")
 
         yield SSEResponse(
             event="response",

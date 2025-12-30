@@ -84,13 +84,22 @@ async def stream_outlines(
             presentation_outlines_text += chunk
 
         try:
+            print(f"[OUTLINES] Attempting to parse {len(presentation_outlines_text)} characters")
+            print(f"[OUTLINES] First 200 chars: {presentation_outlines_text[:200]}")
+            print(f"[OUTLINES] Last 200 chars: {presentation_outlines_text[-200:]}")
+
+            if not presentation_outlines_text.strip():
+                raise ValueError("LLM returned empty response")
+
             presentation_outlines_json = dict(
                 dirtyjson.loads(presentation_outlines_text)
             )
         except Exception as e:
             traceback.print_exc()
+            print(f"[OUTLINES] Failed to parse outline text. Length: {len(presentation_outlines_text)}")
+            print(f"[OUTLINES] Content: {presentation_outlines_text}")
             yield SSEErrorResponse(
-                detail=f"Failed to generate presentation outlines. Please try again. {str(e)}",
+                detail=f"Failed to generate presentation outlines. Please try again. Error: {str(e)}",
             ).to_string()
             return
 

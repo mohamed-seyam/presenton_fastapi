@@ -8,11 +8,6 @@ from services.image_generation_service import ImageGenerationService
 from utils.asset_directory_utils import get_images_directory
 from utils.dict_utils import get_dict_at_path, get_dict_paths_with_key, set_dict_at_path
 
-# Global semaphore to limit concurrent slide processing
-# This makes debugging easier and prevents resource exhaustion
-SLIDE_PROCESSING_SEMAPHORE = asyncio.Semaphore(2)  # Process max 2 slides at once
-
-
 async def process_slide_and_fetch_assets(
     image_generation_service: ImageGenerationService,
     slide: SlideModel,
