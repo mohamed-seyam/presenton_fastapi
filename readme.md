@@ -10,5 +10,5 @@ list the services at specific port
 `ss -tlnp | grep :8000`
 
 kill the process 
-sudo kill (pid)
+`sudo kill (pid)`
 

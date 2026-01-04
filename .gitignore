@@ -155,3 +155,5 @@ ollama_data/
 
 # UV lock file (uncomment if you want to ignore it)
 # uv.lock
+tmp
+performance_test_output
